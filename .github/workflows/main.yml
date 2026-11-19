@@ -1,0 +1,126 @@
+name: Sable Calculator v100.0 — Android Release
+
+'on':
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sable-android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-build:
+    name: Verify source and build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Java 17 for Capacitor 7 / Android Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sdkmanager --install 'platform-tools' 'platforms;android-35' 'build-tools;35.0.0'
+          yes | sdkmanager --licenses >/dev/null || true
+          test -d "$ANDROID_HOME/platforms/android-35"
+          test -d "$ANDROID_HOME/build-tools/35.0.0"
+
+      - name: Verify repository root and Sable release identity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f package.json
+          test -f index.html
+          test -f capacitor.config.json
+          test -f .github/workflows/main.yml
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const html = fs.readFileSync('index.html', 'utf8');
+          const manifest = JSON.parse(fs.readFileSync('manifest.webmanifest', 'utf8'));
+          const capacitor = JSON.parse(fs.readFileSync('capacitor.config.json', 'utf8'));
+          if (pkg.name !== 'sable-calculator' || pkg.version !== '2.00.0-v100.0') throw new Error('Wrong project or release version. Upload the Sable project at repository root.');
+          if (!html.includes(pkg.version) || manifest.name !== 'Sable Calculator') throw new Error('HTML / manifest release identity mismatch.');
+          if (capacitor.appId !== 'com.sable.calculator' || capacitor.webDir !== 'www') throw new Error('Capacitor appId or webDir mismatch.');
+          const required = [
+            'assets/css/app.css', 'assets/js/app.js', 'assets/js/sable-calculators.js',
+            'assets/js/localization.js', 'assets/js/currency-localized-names.js',
+            'assets/js/theme-bootstrap.js', 'service-worker.js', 'scripts/prepare-android-web.mjs',
+            'scripts/patch-android-native.mjs'
+          ];
+          for (const file of required) if (!fs.existsSync(file) || !fs.statSync(file).size) throw new Error(`Missing or empty required file: ${file}`);
+          if ((html.match(/data-tool-screen=/g) || []).length !== 23) throw new Error('Expected exactly 23 tool destinations.');
+          if (!fs.readFileSync('assets/css/app.css', 'utf8').includes('SABLE v100.0')) throw new Error('Sable design system missing.');
+          console.log(`Verified ${pkg.name} ${pkg.version}; 23 tool destinations; Capacitor app ${capacitor.appId}.`);
+          NODE
+
+      - name: Install pinned project dependencies
+        run: npm install --no-audit --no-fund --prefer-offline
+
+      - name: Verify installed Capacitor dependency tree
+        run: npm ls --depth=0
+
+      - name: Run full regression suite
+        run: npm test
+
+      - name: Build and verify web bundle
+        run: npm run build:web
+
+      - name: Add Android platform
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ ! -d android ]; then npx cap add android; fi
+          test -f android/gradlew
+          test -f android/app/build.gradle || test -f android/app/build.gradle.kts
+          test -f android/app/src/main/AndroidManifest.xml
+
+      - name: Apply Sable Android branding and system-bar insets
+        run: npm run android:brand
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm run android:apk
+          APK='android/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          test "$(stat -c%s "$APK")" -gt 100000
+          echo "APK generated: $(stat -c%s "$APK") bytes"
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sable-Calculator-v100.0-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
